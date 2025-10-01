@@ -106,3 +106,7 @@ temp/
 .DS_Store
 Thumbs.db
 .codacy/codacy.yaml
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md
