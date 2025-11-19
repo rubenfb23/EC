@@ -118,3 +118,13 @@ data/
 dataset/
 tmp/
 src/animal_face/AnimalFace
+
+*.res
+*.png
+*.jpg
+*.jpeg
+*.htm
+*.dot
+*.txt
+*.pdf
+*.m
