@@ -128,3 +128,7 @@ src/animal_face/AnimalFace
 *.txt
 *.pdf
 *.m
+*json
+LICENSE
+*.csv
+*.npmignore
