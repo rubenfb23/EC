@@ -10,7 +10,11 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 # Preferred defaults if no input file is provided explicitly.
-DEFAULT_CANDIDATES = ("merged_ai_human_multisocial_features.csv",)
+DEFAULT_CANDIDATES = (
+    "merged_ai_human_multisocial_features_cleaned.csv",
+    "merged_ai_human_multisocial_features.csv",
+    "ai_human_content_detection_dataset.csv",
+)
 
 
 def find_input_path(explicit_path: Optional[str]) -> Path:
@@ -68,6 +72,14 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for reproducibility. Default: 42",
     )
     parser.add_argument(
+        "--dataset-test",
+        help=(
+            "Optional dataset flag suffix to use as test split. "
+            "For example, 'multisocial' will use rows where ds_multisocial is True "
+            "as the test set and the remaining rows as train."
+        ),
+    )
+    parser.add_argument(
         "--no-stratify",
         action="store_true",
         help="Disable stratified splitting even if the column exists.",
@@ -78,7 +90,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if not 0 < args.test_size < 1:
+    if args.dataset_test is None and not 0 < args.test_size < 1:
         raise ValueError(
             f"test_size must be between 0 and 1. Received: {args.test_size}"
         )
@@ -93,29 +105,49 @@ def main() -> None:
 
     df = pd.read_csv(input_path)
 
-    stratify_series = None
-    if not args.no_stratify:
-        if args.stratify_column in df.columns:
-            unique_vals = df[args.stratify_column].dropna().unique()
-            if len(unique_vals) > 1:
-                stratify_series = df[args.stratify_column]
+    if args.dataset_test:
+        ds_col = f"ds_{args.dataset_test}"
+        if ds_col not in df.columns:
+            raise ValueError(
+                f"--dataset-test was set to '{args.dataset_test}', "
+                f"but column `{ds_col}` was not found in the input data."
+            )
+        test_mask = df[ds_col].astype(bool)
+        test_df = df[test_mask]
+        train_df = df[~test_mask]
+        if test_df.empty or train_df.empty:
+            raise ValueError(
+                f"Dataset split using `{ds_col}` produced an empty "
+                f"{'test' if test_df.empty else 'train'} set."
+            )
+        print(
+            f"Using dataset-based split with `{ds_col}`: "
+            f"train={len(train_df)}, test={len(test_df)}"
+        )
+    else:
+        stratify_series = None
+        if not args.no_stratify:
+            if args.stratify_column in df.columns:
+                unique_vals = df[args.stratify_column].dropna().unique()
+                if len(unique_vals) > 1:
+                    stratify_series = df[args.stratify_column]
+                else:
+                    print(
+                        f"Stratify column `{args.stratify_column}` has a single class; "
+                        "falling back to random split."
+                    )
             else:
                 print(
-                    f"Stratify column `{args.stratify_column}` has a single class; "
+                    f"Stratify column `{args.stratify_column}` not found; "
                     "falling back to random split."
                 )
-        else:
-            print(
-                f"Stratify column `{args.stratify_column}` not found; "
-                "falling back to random split."
-            )
 
-    train_df, test_df = train_test_split(
-        df,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=stratify_series,
-    )
+        train_df, test_df = train_test_split(
+            df,
+            test_size=args.test_size,
+            random_state=args.random_state,
+            stratify=stratify_series,
+        )
 
     suffix = input_path.suffix or ".csv"
     train_path = output_dir / f"{input_path.stem}_train{suffix}"
