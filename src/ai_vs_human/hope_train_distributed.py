@@ -728,7 +728,7 @@ def train_fold(
                 val_labels.append(batch["labels"].to(device))
 
         # Gather predictions from all GPUs
-        val_preds = torch.cat(val_preds)
+        val_preds = torch.cat(val_preds).float()
         val_labels = torch.cat(val_labels)
 
         # Gather all predictions to rank 0
@@ -738,7 +738,7 @@ def train_fold(
         dist.all_gather(all_labels, val_labels)
 
         if is_main_process():
-            all_preds = torch.cat(all_preds).cpu().numpy()
+            all_preds = torch.cat(all_preds).float().cpu().numpy()
             all_labels = torch.cat(all_labels).cpu().numpy()
 
             # Remove duplicates from distributed sampler padding
@@ -799,12 +799,12 @@ def train_fold(
             probs = F.softmax(outputs["logits"], dim=-1)[:, 1]
             oof_preds.append(probs)
 
-    oof_preds = torch.cat(oof_preds)
+    oof_preds = torch.cat(oof_preds).float()
     all_oof = [torch.zeros_like(oof_preds) for _ in range(world_size)]
     dist.all_gather(all_oof, oof_preds)
 
     if is_main_process():
-        all_oof = torch.cat(all_oof).cpu().numpy()[: len(val_data)]
+        all_oof = torch.cat(all_oof).float().cpu().numpy()[: len(val_data)]
     else:
         all_oof = None
 
@@ -980,7 +980,7 @@ def main():
                             )
 
                         probs = F.softmax(outputs["logits"], dim=-1)[:, 1]
-                        fold_preds.extend(probs.cpu().numpy())
+                        fold_preds.extend(probs.float().cpu().numpy())
 
                 all_preds.append(fold_preds)
                 del model
