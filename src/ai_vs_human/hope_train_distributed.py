@@ -27,11 +27,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from functools import partial
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-from torch.optim import AdamW
+from torch.distributed.fsdp import (
+    CPUOffload,
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.optim import Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from transformers import AutoModel, AutoTokenizer, set_seed
@@ -246,11 +253,14 @@ class ContinuumMemorySystem(nn.Module):
 
         self.level_weights = nn.Parameter(torch.ones(num_levels) / num_levels)
         self.register_buffer("step_counter", torch.tensor(0))
+        self.slowest_frequency = max(self.update_frequencies)
+        self.register_buffer("last_sync_step", torch.tensor(0))
 
     def forward(
         self,
         x: torch.Tensor,
         return_level_outputs: bool = False,
+        return_memory_loss: bool = False,
     ) -> torch.Tensor:
         level_outputs = []
         level_metrics = []
@@ -284,7 +294,17 @@ class ContinuumMemorySystem(nn.Module):
             output = weighted + fused
 
         if return_level_outputs:
+            if return_memory_loss:
+                return (
+                    output,
+                    level_outputs,
+                    level_metrics,
+                    self.get_total_memory_loss(x),
+                )
             return output, level_outputs, level_metrics
+
+        if return_memory_loss:
+            return output, self.get_total_memory_loss(x)
 
         return output
 
@@ -299,11 +319,26 @@ class ContinuumMemorySystem(nn.Module):
 
     def reset_step_counter(self):
         self.step_counter.zero_()
+        self.last_sync_step.zero_()
 
+    @torch.no_grad()
     def sync_step_counter(self):
-        """Synchronize step counter across all GPUs."""
-        if dist.is_initialized():
-            dist.all_reduce(self.step_counter, op=dist.ReduceOp.MAX)
+        """
+        Periodically synchronize CMS state without per-step all-reduce.
+
+        High-frequency blocks accumulate locally; we only align counters after
+        completing one full window of the slowest block to save PCIe bandwidth.
+        """
+        if not dist.is_initialized():
+            return
+
+        steps_since_sync = int((self.step_counter - self.last_sync_step).item())
+        if steps_since_sync < self.slowest_frequency:
+            return
+
+        # Cheap broadcast keeps schedules aligned without hammering all_reduce
+        dist.broadcast(self.step_counter, src=0)
+        self.last_sync_step.copy_(self.step_counter)
 
 
 class SelfReferentialModule(nn.Module):
@@ -398,7 +433,10 @@ class HOPEClassifier(nn.Module):
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_pooled = (hidden_states * attn_weights.unsqueeze(-1)).sum(dim=1)
 
-        memory_output = self.cms(mean_pooled)
+        if return_memory_loss:
+            memory_output, memory_loss = self.cms(mean_pooled, return_memory_loss=True)
+        else:
+            memory_output = self.cms(mean_pooled)
 
         if self.self_ref is not None:
             memory_output = self.self_ref(mean_pooled, memory_output)
@@ -414,7 +452,6 @@ class HOPEClassifier(nn.Module):
             output["loss"] = loss
 
         if return_memory_loss:
-            memory_loss = self.cms.get_total_memory_loss(mean_pooled)
             output["memory_loss"] = memory_loss
 
         return output
@@ -525,6 +562,153 @@ def reduce_tensor(tensor: torch.Tensor, op=dist.ReduceOp.SUM) -> torch.Tensor:
 
 
 # =============================================================================
+# Optimizer: M3 (Multi-scale Momentum Muon)
+# =============================================================================
+
+
+class M3(Optimizer):
+    """
+    Multi-scale Momentum Muon optimizer.
+
+    - Hierarchical momenta: each level integrates the level below (not the raw grad),
+      stabilizing nested loops.
+    - Newton-Schulz orthogonalization on the update covariance to condition steps.
+    - Decoupled weight decay (AdamW style).
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 2e-5,
+        betas: Tuple[float, ...] = (0.9, 0.95),
+        weight_decay: float = 0.01,
+        eps: float = 1e-8,
+        ns_iters: int = 5,
+        ns_eps: float = 1e-4,
+    ):
+        if lr <= 0.0:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if any(b <= 0.0 or b >= 1.0 for b in betas):
+            raise ValueError("Invalid beta parameter(s): {}".format(betas))
+
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            eps=eps,
+            ns_iters=ns_iters,
+            ns_eps=ns_eps,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def _newton_schulz(self, mat: torch.Tensor, num_iters: int, eps: float):
+        """Matrix inverse square root via Newton-Schulz iteration."""
+        # Scale for numerical stability
+        norm = mat.norm() + eps
+        Y = mat / norm
+        I = torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
+        Z = I.clone()
+
+        for _ in range(num_iters):
+            T = 0.5 * (3.0 * I - Z @ Y)
+            Y = Y @ T
+            Z = T @ Z
+
+        return Z / norm.sqrt()
+
+    @torch.no_grad()
+    def _orthogonalize_update(
+        self, update: torch.Tensor, num_iters: int, eps: float
+    ) -> torch.Tensor:
+        if update.ndim < 2:
+            return update
+
+        # Flatten into (rows, cols)
+        flat = update.reshape(update.shape[0], -1)
+        mat = flat if flat.dtype in (torch.float32, torch.float64) else flat.float()
+
+        cov = mat @ mat.transpose(0, 1)
+        cov = cov + eps * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+
+        inv_sqrt = self._newton_schulz(cov, num_iters=num_iters, eps=eps)
+        conditioned = inv_sqrt @ mat
+        conditioned = conditioned.to(update.dtype)
+        return conditioned.reshape_as(update)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            betas = group["betas"]
+            weight_decay = group["weight_decay"]
+            eps = group["eps"]
+            ns_iters = group["ns_iters"]
+            ns_eps = group["ns_eps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("M3 does not support sparse gradients.")
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["momentums"] = [torch.zeros_like(p) for _ in betas]
+
+                state["step"] += 1
+
+                # Decoupled weight decay
+                if weight_decay != 0:
+                    p.data.add_(p.data, alpha=-lr * weight_decay)
+
+                # Hierarchical momentum: each level follows the previous level
+                prev = grad
+                momentums = state["momentums"]
+                for i, beta in enumerate(betas):
+                    m = momentums[i]
+                    m.mul_(beta).add_(prev, alpha=1.0 - beta)
+                    momentums[i] = m
+                    prev = m
+
+                update = momentums[-1]
+                update = self._orthogonalize_update(update, ns_iters, ns_eps + eps)
+
+                p.add_(update, alpha=-lr)
+
+        return loss
+
+
+def build_fsdp_auto_wrap_policy():
+    """
+    Size-based auto wrap that keeps the ContinuumMemorySystem intact.
+
+    We wrap CMS as a single FSDP unit so the memory hierarchy is not fragmented,
+    and skip wrapping its inner NeuralMemoryModule blocks. Everything else
+    follows a 10M parameter threshold.
+    """
+
+    base_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=10_000_000)
+
+    def _policy(module, recurse, nonwrapped_numel, **kwargs):
+        if isinstance(module, ContinuumMemorySystem):
+            return True
+        if isinstance(module, NeuralMemoryModule):
+            return False
+        return base_wrap_policy(module, recurse, nonwrapped_numel)
+
+    return _policy
+
+
+# =============================================================================
 # Training
 # =============================================================================
 
@@ -581,42 +765,50 @@ def train_fold(
         train_dataset,
         batch_size=config.batch_size,
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=16,
         pin_memory=True,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size * 2,
         sampler=val_sampler,
-        num_workers=4,
+        num_workers=16,
         pin_memory=True,
+        persistent_workers=True,
     )
 
-    # Initialize model with DDP
+    # Initialize model with FSDP
     device = torch.device(f"cuda:{local_rank}")
-    model = HOPEClassifier(config).to(device)
-    # Some branches in HOPE may not touch every parameter each step; allow DDP to handle them.
-    model = DDP(
-        model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        find_unused_parameters=True,
+    base_model = HOPEClassifier(config).to(device)
+
+    fsdp_policy = build_fsdp_auto_wrap_policy()
+    fsdp_state_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+
+    model = FSDP(
+        base_model,
+        auto_wrap_policy=fsdp_policy,
+        cpu_offload=CPUOffload(offload_params=True),
+        device_id=local_rank,
+        sync_module_states=True,
+        use_orig_params=True,
     )
 
     # Access the underlying module for parameter groups
     base_model = model.module
 
-    # Nested optimization: two optimizers
-    outer_optimizer = AdamW(
+    # Nested optimization: two optimizers (M3 for stability in nested loops)
+    outer_optimizer = M3(
         base_model.get_encoder_parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
 
-    inner_optimizer = AdamW(
+    inner_optimizer = M3(
         base_model.get_memory_parameters(),
         lr=config.memory_lr,
         weight_decay=config.weight_decay * 0.1,
+        betas=(0.9, 0.98),
     )
 
     # Schedulers
@@ -675,14 +867,14 @@ def train_fold(
             epoch_memory_loss += mem_loss.detach() * config.gradient_accumulation
             num_batches += 1
 
-            # Sync CMS step counter periodically
-            if config.sync_cms_steps and step % 10 == 0:
+            # Let CMS perform local accumulation and sync only when needed
+            if config.sync_cms_steps:
                 base_model.cms.sync_step_counter()
 
             if (step + 1) % config.gradient_accumulation == 0:
                 scaler.unscale_(outer_optimizer)
                 scaler.unscale_(inner_optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                model.clip_grad_norm_(1.0)
 
                 for _ in range(config.inner_steps):
                     scaler.step(inner_optimizer)
@@ -756,9 +948,10 @@ def train_fold(
 
             if val_auc > best_auc:
                 best_auc = val_auc
-                best_model_state = {
-                    k: v.cpu().clone() for k, v in base_model.state_dict().items()
-                }
+                with FSDP.state_dict_type(
+                    model, StateDictType.FULL_STATE_DICT, fsdp_state_cfg
+                ):
+                    best_model_state = model.state_dict()
                 print(f"  -> New best model! AUC: {best_auc:.5f}")
 
         # Broadcast best_auc to all ranks
@@ -778,13 +971,16 @@ def train_fold(
     dist.barrier()
 
     # Get OOF predictions using best model
-    if is_main_process() and best_model_state is not None:
-        base_model.load_state_dict(best_model_state)
+    has_best_state = best_model_state is not None or model_path.exists()
+    if has_best_state:
+        if is_main_process() and best_model_state is None:
+            best_model_state = torch.load(model_path, map_location="cpu")
 
-    # Broadcast model state to all ranks
-    for param in base_model.parameters():
-        dist.broadcast(param.data, src=0)
+        load_state = best_model_state if is_main_process() else {}
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_state_cfg):
+            model.load_state_dict(load_state)
 
+    dist.barrier()
     model.eval()
     oof_preds = []
 
@@ -819,7 +1015,7 @@ def main():
     parser = argparse.ArgumentParser(description="HOPE Distributed Training")
     parser.add_argument("--data_dir", type=str, default=None, help="Data directory")
     parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=28, help="Per-GPU batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Per-GPU batch size")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--n_splits", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
