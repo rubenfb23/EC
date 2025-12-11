@@ -31,8 +31,12 @@ from typing import Optional, List, Tuple, Dict, Any, Union
 from dataclasses import dataclass, field
 import argparse
 
+import csv
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server/distributed environments
+import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
@@ -184,6 +188,13 @@ class NeuralMemoryModule(nn.Module):
         eta_t = self.eta * self.eta_gate(x_pooled).squeeze(-1)
         theta_t = self.theta * self.theta_gate(x_pooled).squeeze(-1)
         alpha_t = self.alpha * self.alpha_gate(x_pooled).squeeze(-1)
+
+        # Store gate statistics for monitoring (detached to avoid affecting computation graph)
+        self.last_stats = {
+            "eta_mean": eta_t.mean().detach().cpu().item(),
+            "theta_mean": theta_t.mean().detach().cpu().item(),
+            "alpha_mean": alpha_t.mean().detach().cpu().item(),
+        }
 
         # MLP pass 1: Predict values from keys (for association loss)
         predicted_values = self.memory_mlp(keys)
@@ -548,6 +559,237 @@ def reduce_tensor(tensor: torch.Tensor, op=dist.ReduceOp.SUM) -> torch.Tensor:
     rt = tensor.clone()
     dist.all_reduce(rt, op=op)
     return rt
+
+
+# =============================================================================
+# Training Monitor for Real-Time Visualization
+# =============================================================================
+
+
+class TrainingMonitor:
+    """
+    Real-time monitoring and visualization for HOPE training.
+
+    Only runs on Rank 0 to avoid file conflicts in distributed training.
+    Logs metrics to CSV and generates plots at configurable intervals.
+    """
+
+    def __init__(
+        self,
+        output_dir: Union[str, Path] = "training_metrics",
+        plot_interval: int = 100,
+        num_memory_levels: int = 3,
+    ):
+        self.output_dir = Path(output_dir)
+        self.plot_interval = plot_interval
+        self.num_memory_levels = num_memory_levels
+
+        # Create output directory if it doesn't exist
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # CSV file path
+        self.csv_path = self.output_dir / "metrics_log.csv"
+
+        # Historical data storage
+        self.history: Dict[str, List[float]] = {
+            "step": [],
+            "epoch": [],
+            "cls_loss": [],
+            "mem_loss": [],
+            "outer_lr": [],
+            "inner_lr": [],
+        }
+        # Add gate metrics for each memory level
+        for level in range(num_memory_levels):
+            self.history[f"eta_mean_L{level}"] = []
+            self.history[f"theta_mean_L{level}"] = []
+            self.history[f"alpha_mean_L{level}"] = []
+
+        # Initialize CSV with headers
+        self._init_csv()
+
+    def _init_csv(self):
+        """Initialize CSV file with headers."""
+        with open(self.csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(list(self.history.keys()))
+
+    def log(
+        self,
+        step: int,
+        epoch: int,
+        cls_loss: float,
+        mem_loss: float,
+        outer_optimizer: Optimizer,
+        inner_optimizer: Optimizer,
+        model: nn.Module,
+    ):
+        """
+        Log metrics for the current step.
+
+        Args:
+            step: Current global step (optimizer steps, not micro-batches)
+            epoch: Current epoch
+            cls_loss: Classification loss value
+            mem_loss: Memory loss value
+            outer_optimizer: Encoder optimizer (for LR extraction)
+            inner_optimizer: Memory optimizer (for LR extraction)
+            model: The FSDP-wrapped model
+        """
+        # Extract learning rates
+        outer_lr = outer_optimizer.param_groups[0]["lr"]
+        inner_lr = inner_optimizer.param_groups[0]["lr"]
+
+        # Extract gate statistics from memory levels
+        # Access underlying module through FSDP wrapper
+        try:
+            base_module = model.module if hasattr(model, "module") else model
+            memory_levels = base_module.cms.memory_levels
+
+            gate_stats = []
+            for level_idx, memory in enumerate(memory_levels):
+                if hasattr(memory, "last_stats"):
+                    gate_stats.append(memory.last_stats)
+                else:
+                    # Fallback if last_stats not yet computed
+                    gate_stats.append({
+                        "eta_mean": 0.0,
+                        "theta_mean": 0.0,
+                        "alpha_mean": 0.0,
+                    })
+        except Exception:
+            # Fallback for edge cases
+            gate_stats = [
+                {"eta_mean": 0.0, "theta_mean": 0.0, "alpha_mean": 0.0}
+                for _ in range(self.num_memory_levels)
+            ]
+
+        # Append to history
+        self.history["step"].append(step)
+        self.history["epoch"].append(epoch)
+        self.history["cls_loss"].append(cls_loss)
+        self.history["mem_loss"].append(mem_loss)
+        self.history["outer_lr"].append(outer_lr)
+        self.history["inner_lr"].append(inner_lr)
+
+        for level_idx, stats in enumerate(gate_stats):
+            self.history[f"eta_mean_L{level_idx}"].append(stats["eta_mean"])
+            self.history[f"theta_mean_L{level_idx}"].append(stats["theta_mean"])
+            self.history[f"alpha_mean_L{level_idx}"].append(stats["alpha_mean"])
+
+        # Append row to CSV
+        row = [
+            step, epoch, cls_loss, mem_loss, outer_lr, inner_lr,
+        ]
+        for level_idx in range(self.num_memory_levels):
+            row.extend([
+                gate_stats[level_idx]["eta_mean"],
+                gate_stats[level_idx]["theta_mean"],
+                gate_stats[level_idx]["alpha_mean"],
+            ])
+
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+        # Generate plots at intervals
+        if step > 0 and step % self.plot_interval == 0:
+            self._generate_plots()
+
+    def _generate_plots(self):
+        """Generate and save monitoring plots."""
+        steps = self.history["step"]
+        if len(steps) < 2:
+            return
+
+        # Plot 1: Losses
+        self._plot_losses(steps)
+
+        # Plot 2: Gate evolution
+        self._plot_gates(steps)
+
+        # Plot 3: Learning rates
+        self._plot_lrs(steps)
+
+        plt.close('all')  # Free memory
+
+    def _plot_losses(self, steps: List[int]):
+        """Plot classification and memory losses."""
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        color_cls = 'tab:blue'
+        ax1.set_xlabel('Step')
+        ax1.set_ylabel('Classification Loss', color=color_cls)
+        ax1.plot(steps, self.history["cls_loss"], color=color_cls, label='CLS Loss', alpha=0.8)
+        ax1.tick_params(axis='y', labelcolor=color_cls)
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = ax1.twinx()
+        color_mem = 'tab:orange'
+        ax2.set_ylabel('Memory Loss', color=color_mem)
+        ax2.plot(steps, self.history["mem_loss"], color=color_mem, label='Mem Loss', alpha=0.8)
+        ax2.tick_params(axis='y', labelcolor=color_mem)
+
+        fig.suptitle('Training Losses Over Time', fontsize=14, fontweight='bold')
+        fig.legend(loc='upper right', bbox_to_anchor=(0.88, 0.88))
+        fig.tight_layout()
+        fig.savefig(self.output_dir / "plot_losses.png", dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    def _plot_gates(self, steps: List[int]):
+        """Plot gate evolution across memory levels."""
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        gate_names = ["eta", "theta", "alpha"]
+        gate_labels = [r"$\eta$ (Input Gate)", r"$\theta$ (Surprise Gate)", r"$\alpha$ (Forget Gate)"]
+        colors = plt.cm.viridis(np.linspace(0.2, 0.8, self.num_memory_levels))
+
+        for ax_idx, (gate_name, gate_label) in enumerate(zip(gate_names, gate_labels)):
+            ax = axes[ax_idx]
+            for level_idx in range(self.num_memory_levels):
+                key = f"{gate_name}_mean_L{level_idx}"
+                ax.plot(
+                    steps,
+                    self.history[key],
+                    color=colors[level_idx],
+                    label=f"Level {level_idx}",
+                    alpha=0.8,
+                    linewidth=1.5,
+                )
+            ax.set_xlabel('Step')
+            ax.set_ylabel(f'{gate_label} Mean')
+            ax.set_title(gate_label)
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+        fig.suptitle('Memory Gate Evolution (Saturation Monitor)', fontsize=14, fontweight='bold')
+        fig.tight_layout()
+        fig.savefig(self.output_dir / "plot_gates.png", dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    def _plot_lrs(self, steps: List[int]):
+        """Plot learning rate schedules."""
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        ax.plot(steps, self.history["outer_lr"], label='Encoder LR (Outer)', color='tab:blue', linewidth=2)
+        ax.plot(steps, self.history["inner_lr"], label='Memory LR (Inner)', color='tab:red', linewidth=2)
+
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Learning Rate')
+        ax.set_title('Learning Rate Schedules', fontsize=14, fontweight='bold')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_yscale('log')  # Log scale for LRs
+
+        fig.tight_layout()
+        fig.savefig(self.output_dir / "plot_lrs.png", dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    def finalize(self):
+        """Generate final plots at the end of training."""
+        if len(self.history["step"]) > 0:
+            self._generate_plots()
+            print_rank0(f"Training metrics saved to: {self.output_dir}")
 
 
 # =============================================================================
