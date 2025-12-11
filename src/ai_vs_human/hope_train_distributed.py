@@ -14,10 +14,20 @@ References:
 """
 
 import os
+import warnings
+
+# Suppress warnings before other imports
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*NCCL.*")
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
+
 import random
 import math
+import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Union
 from dataclasses import dataclass, field
 import argparse
 
@@ -41,7 +51,9 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from transformers import AutoModel, AutoTokenizer, set_seed
+from transformers import AutoModel, AutoTokenizer, set_seed, logging as transformers_logging
+transformers_logging.set_verbosity_error()
+
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, accuracy_score
 from tqdm.auto import tqdm
@@ -95,7 +107,7 @@ class HOPEConfig:
     use_self_referential: bool = True
 
     # Distributed
-    sync_cms_steps: bool = True  # Synchronize CMS step counter across GPUs
+    sync_cms_steps: bool = False  # Disable CMS sync to prevent NCCL hangs
 
 
 # =============================================================================
@@ -151,25 +163,15 @@ class NeuralMemoryModule(nn.Module):
         self.register_buffer("surprise_momentum_buffer", None)
         self.output_proj = nn.Linear(memory_dim, input_dim)
 
-    def compute_surprise(
-        self, keys: torch.Tensor, values: torch.Tensor
-    ) -> torch.Tensor:
-        predicted_values = self.memory_mlp(keys)
-        loss = F.mse_loss(predicted_values, values, reduction="none")
-        surprise = loss.mean(dim=-1, keepdim=True)
-        return surprise, loss.mean()
-
     def forward(
         self,
         x: torch.Tensor,
-        update_memory: bool = True,
-        return_surprise: bool = False,
-    ) -> torch.Tensor:
+        return_loss: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
-        batch_size, seq_len, _ = x.shape
-
+        # Project to keys, values, queries
         keys = self.key_proj(x)
         values = self.value_proj(x)
         queries = self.query_proj(x)
@@ -177,36 +179,27 @@ class NeuralMemoryModule(nn.Module):
         keys = F.normalize(keys, p=2, dim=-1)
         queries = F.normalize(queries, p=2, dim=-1)
 
+        # Compute gated parameters (preserved for architecture)
         x_pooled = x.mean(dim=1)
         eta_t = self.eta * self.eta_gate(x_pooled).squeeze(-1)
         theta_t = self.theta * self.theta_gate(x_pooled).squeeze(-1)
         alpha_t = self.alpha * self.alpha_gate(x_pooled).squeeze(-1)
 
-        surprise, assoc_loss = self.compute_surprise(keys, values)
+        # MLP pass 1: Predict values from keys (for association loss)
+        predicted_values = self.memory_mlp(keys)
+        assoc_loss = F.mse_loss(predicted_values, values)
+
+        # MLP pass 2: Retrieve from queries (for output)
         retrieved = self.memory_mlp(queries)
         output = self.output_proj(retrieved)
 
         if output.size(1) == 1:
             output = output.squeeze(1)
 
-        if return_surprise:
-            return output, {
-                "surprise": surprise.mean(),
-                "assoc_loss": assoc_loss,
-                "eta": eta_t.mean(),
-                "theta": theta_t.mean(),
-                "alpha": alpha_t.mean(),
-            }
+        if return_loss:
+            return output, assoc_loss
 
         return output
-
-    def get_memory_loss(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        keys = F.normalize(self.key_proj(x), p=2, dim=-1)
-        values = self.value_proj(x)
-        predicted = self.memory_mlp(keys)
-        return F.mse_loss(predicted, values)
 
 
 class ContinuumMemorySystem(nn.Module):
@@ -261,22 +254,19 @@ class ContinuumMemorySystem(nn.Module):
         x: torch.Tensor,
         return_level_outputs: bool = False,
         return_memory_loss: bool = False,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         level_outputs = []
-        level_metrics = []
+        level_losses = []
 
         for i, (memory, freq) in enumerate(
             zip(self.memory_levels, self.update_frequencies)
         ):
-            should_update = self.step_counter % freq == 0
-            output, metrics = memory(
-                x, update_memory=should_update, return_surprise=True
-            )
+            output, assoc_loss = memory(x, return_loss=True)
             level_outputs.append(output)
-            level_metrics.append(metrics)
+            level_losses.append(assoc_loss)
 
-        if self.training:
-            self.step_counter += 1
+        # Note: step_counter is incremented in the training loop once per optimizer step,
+        # not here per micro-batch, to correctly align with gradient accumulation.
 
         weights = F.softmax(self.level_weights, dim=0)
 
@@ -295,26 +285,21 @@ class ContinuumMemorySystem(nn.Module):
 
         if return_level_outputs:
             if return_memory_loss:
-                return (
-                    output,
-                    level_outputs,
-                    level_metrics,
-                    self.get_total_memory_loss(x),
-                )
-            return output, level_outputs, level_metrics
+                total_memory_loss = self._compute_weighted_loss(level_losses)
+                return output, level_outputs, level_losses, total_memory_loss
+            return output, level_outputs, level_losses
 
         if return_memory_loss:
-            return output, self.get_total_memory_loss(x)
+            total_memory_loss = self._compute_weighted_loss(level_losses)
+            return output, total_memory_loss
 
         return output
 
-    def get_total_memory_loss(self, x: torch.Tensor) -> torch.Tensor:
-        total_loss = 0
-        for i, (memory, freq) in enumerate(
-            zip(self.memory_levels, self.update_frequencies)
-        ):
+    def _compute_weighted_loss(self, level_losses: List[torch.Tensor]) -> torch.Tensor:
+        total_loss = torch.tensor(0.0, device=level_losses[0].device)
+        for loss, freq in zip(level_losses, self.update_frequencies):
             weight = 1.0 / freq
-            total_loss += weight * memory.get_memory_loss(x)
+            total_loss = total_loss + weight * loss
         return total_loss
 
     def reset_step_counter(self):
@@ -326,8 +311,8 @@ class ContinuumMemorySystem(nn.Module):
         """
         Periodically synchronize CMS state without per-step all-reduce.
 
-        High-frequency blocks accumulate locally; we only align counters after
-        completing one full window of the slowest block to save PCIe bandwidth.
+        WARNING: This method can cause NCCL deadlocks if ranks have different
+        step counts. Only call at epoch boundaries or keep sync_cms_steps=False.
         """
         if not dist.is_initialized():
             return
@@ -336,7 +321,6 @@ class ContinuumMemorySystem(nn.Module):
         if steps_since_sync < self.slowest_frequency:
             return
 
-        # Cheap broadcast keeps schedules aligned without hammering all_reduce
         dist.broadcast(self.step_counter, src=0)
         self.last_sync_step.copy_(self.step_counter)
 
@@ -523,7 +507,12 @@ class TextDataset(Dataset):
 
 def setup_distributed():
     """Initialize distributed training."""
-    dist.init_process_group(backend="nccl")
+    # Increase NCCL timeout to 30 minutes (default is 10 minutes)
+    os.environ.setdefault("NCCL_TIMEOUT", "1800")
+    # Enable async error handling for better debugging
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=30))
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
@@ -765,7 +754,7 @@ def train_fold(
         train_dataset,
         batch_size=config.batch_size,
         sampler=train_sampler,
-        num_workers=16,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
     )
@@ -773,7 +762,7 @@ def train_fold(
         val_dataset,
         batch_size=config.batch_size * 2,
         sampler=val_sampler,
-        num_workers=16,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True,
     )
@@ -788,7 +777,7 @@ def train_fold(
     model = FSDP(
         base_model,
         auto_wrap_policy=fsdp_policy,
-        cpu_offload=CPUOffload(offload_params=True),
+        cpu_offload=None,  # Disable CPU offload to prevent NCCL timeouts
         device_id=local_rank,
         sync_module_states=True,
         use_orig_params=True,
@@ -867,23 +856,38 @@ def train_fold(
             epoch_memory_loss += mem_loss.detach() * config.gradient_accumulation
             num_batches += 1
 
-            # Let CMS perform local accumulation and sync only when needed
-            if config.sync_cms_steps:
-                base_model.cms.sync_step_counter()
-
             if (step + 1) % config.gradient_accumulation == 0:
                 scaler.unscale_(outer_optimizer)
                 scaler.unscale_(inner_optimizer)
                 model.clip_grad_norm_(1.0)
 
-                for _ in range(config.inner_steps):
-                    scaler.step(inner_optimizer)
+                # Gradient masking for CMS frequency-based updates:
+                # Zero out gradients for memory levels that shouldn't update this step
+                cms = base_model.cms
+                current_step = int(cms.step_counter.item())
+                for level_idx, (memory_level, freq) in enumerate(
+                    zip(cms.memory_levels, cms.update_frequencies)
+                ):
+                    if current_step % freq != 0:
+                        # This level should not update - zero its gradients
+                        for param in memory_level.parameters():
+                            if param.grad is not None:
+                                param.grad = None
 
+                # Single optimizer step for each optimizer (no inner loop)
+                scaler.step(inner_optimizer)
                 scaler.step(outer_optimizer)
                 scaler.update()
 
                 outer_optimizer.zero_grad()
                 inner_optimizer.zero_grad()
+
+                # Increment CMS step counter once per optimizer step
+                cms.step_counter += 1
+
+                # Let CMS perform distributed sync only when needed
+                if config.sync_cms_steps:
+                    cms.sync_step_counter()
 
                 outer_scheduler.step()
                 inner_scheduler.step()
@@ -946,15 +950,27 @@ def train_fold(
                 f"Val AUC={val_auc:.5f}, Val Acc={val_acc:.5f}"
             )
 
-            if val_auc > best_auc:
+            is_new_best = val_auc > best_auc
+            if is_new_best:
                 best_auc = val_auc
-                with FSDP.state_dict_type(
-                    model, StateDictType.FULL_STATE_DICT, fsdp_state_cfg
-                ):
-                    best_model_state = model.state_dict()
                 print(f"  -> New best model! AUC: {best_auc:.5f}")
+        else:
+            is_new_best = False
 
-        # Broadcast best_auc to all ranks
+        # Broadcast save decision from rank 0 so ALL ranks participate in state_dict
+        should_save_tensor = torch.tensor(1 if is_new_best else 0, device=device)
+        dist.broadcast(should_save_tensor, src=0)
+
+        # ALL ranks must call state_dict() together - FSDP requires collective participation
+        if should_save_tensor.item():
+            with FSDP.state_dict_type(
+                model, StateDictType.FULL_STATE_DICT, fsdp_state_cfg
+            ):
+                state_dict = model.state_dict()  # All ranks call this (collective op)
+            if is_main_process():
+                best_model_state = state_dict  # Only rank 0 keeps it
+
+        # Broadcast best_auc to all ranks for consistent state
         best_auc_tensor = torch.tensor(best_auc, device=device)
         dist.broadcast(best_auc_tensor, src=0)
         best_auc = best_auc_tensor.item()
@@ -1015,7 +1031,7 @@ def main():
     parser = argparse.ArgumentParser(description="HOPE Distributed Training")
     parser.add_argument("--data_dir", type=str, default=None, help="Data directory")
     parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Per-GPU batch size")
+    parser.add_argument("--batch_size", type=int, default=30, help="Per-GPU batch size")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--n_splits", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
